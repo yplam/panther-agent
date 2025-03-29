@@ -1,0 +1,11 @@
+python-dotenv
+websockets>=10.1,<14
+langgraph
+langchain
+langchain_openai
+aiohttp
+asyncio
+pydantic
+numpy
+resampy
+opuslib_next==1.1.2
