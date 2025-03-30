@@ -19,12 +19,17 @@ OPUS_FRAME_MS = 60 # Should match server/client Opus encoder/decoder settings
 OPUS_FRAME_SIZE = (TARGET_SAMPLE_RATE * OPUS_FRAME_MS) // 1000
 # Use opuslib_next constants
 OPUS_BITRATE = "auto" # Or e.g., 32000
+# NOTE: The actual ESP32 firmware might use different Opus complexity settings (e.g., 3 or 5)
+# depending on the board, while this script uses the default from opuslib_next.
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("ClientSim")
 
 # State Tracking
+# NOTE: This script simulates a specific scenario (sending one WAV file) and does not
+# replicate the full complex state machine of the ESP32 firmware (e.g., Idle, Connecting,
+# Listening with VAD/Wake Word, Speaking, Auto-reconnect logic, keep_listening).
 is_receiving_tts = False
 tts_audio_buffer = bytearray()
 tts_decoder: Optional[opuslib_next.Decoder] = None
@@ -38,6 +43,10 @@ def read_and_resample_wav(filepath: str) -> Optional[np.ndarray]:
     try:
         data, samplerate = sf.read(filepath, dtype='int16')
         logger.info(f"Read '{filepath}': Sample rate={samplerate}, Channels={data.ndim}, Duration={len(data)/samplerate:.2f}s")
+        # NOTE: This simulates reading a pre-recorded file. The actual ESP32 firmware
+        # reads live audio from a microphone via an AudioCodec, potentially applies
+        # Acoustic Echo Cancellation (AEC), Voice Activity Detection (VAD),
+        # and Wake Word detection before encoding. This script bypasses those steps.
 
         # Ensure numpy array
         data = np.array(data, dtype=np.int16)
@@ -123,6 +132,8 @@ def decode_opus_packets(opus_packets: List[bytes], sample_rate: int, channels: i
         try:
             logger.info(f"Initializing Opus Decoder for TTS: {sample_rate}Hz, {channels}ch")
             tts_decoder = opuslib_next.Decoder(sample_rate, channels)
+            # NOTE: ESP32 firmware resets decoder state explicitly between speaking states.
+            # This script resets by creating a new decoder instance on TTS "start".
         except Exception as e:
             logger.error(f"Failed to initialize Opus decoder: {e}")
             return None
@@ -267,7 +278,7 @@ async def receive_messages(websocket):
         logger.info("Message receiving task finished.")
         # Ensure any remaining buffered TTS audio is processed on disconnect
         if is_receiving_tts and tts_packets:
-            logger.warning("Connection closed during TTS, processing buffered audio...")
+            logger.warning(f"Connection closed during TTS, processing buffered audio...")
             pcm_data = decode_opus_packets(tts_packets, server_tts_sample_rate, TARGET_CHANNELS)
             if pcm_data is not None and len(pcm_data) > 0:
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -275,6 +286,9 @@ async def receive_messages(websocket):
                 save_pcm_to_wav(pcm_data, server_tts_sample_rate, TARGET_CHANNELS, filename)
             tts_packets = []
             is_receiving_tts = False
+            # NOTE: This script decodes TTS audio in a batch when the "stop" message arrives
+            # or on disconnection. The ESP32 firmware likely decodes and plays audio
+            # more incrementally as packets arrive.
 
 
 async def run_client(url: str, token: str, device_id: str, client_id: str, wav_path: str):
@@ -362,6 +376,8 @@ async def run_client(url: str, token: str, device_id: str, client_id: str, wav_p
             receiver_task = asyncio.create_task(receive_messages(websocket))
 
             # Send listen start
+            # NOTE: This simulates a manual start. The ESP32 firmware also handles
+            # wake-word triggered listening and automatic listening after TTS ('keep_listening_').
             listen_start_msg = {"type": "listen", "state": "start", "mode": "manual"} # Or auto? Manual matches WAV file sending better.
             await websocket.send(json.dumps(listen_start_msg))
             logger.info(f"Sent Listen Start: {json.dumps(listen_start_msg)}")

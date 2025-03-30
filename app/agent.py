@@ -18,6 +18,20 @@ from app.services.iot import iot_service # Using the in-memory version
 from app.state_manager import ConnectedClient, ClientState
 import websockets
 
+# Function to create listen messages (used in websocket_handler)
+def create_listen_message(state: str, mode: str = "manual") -> str:
+    """
+    Create a JSON listen message to send to the client.
+    
+    Args:
+        state: One of "start", "stop", or "detect"
+        mode: One of "manual", "auto", or "realtime" (for "start" state only)
+    
+    Returns:
+        JSON string ready to send to the client
+    """
+    return protocol.create_listen_message(state, mode)
+
 # Define the state structure for the graph
 class AgentState(TypedDict):
     client: ConnectedClient               # Reference to the client object
@@ -150,19 +164,6 @@ async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
     opus_decoder = None
     opus_encoder = None
     try:
-        # --- First validate Opus format with non-streaming call ---
-        logger.info(f"{client.client_id}: Validating TTS Opus format with non-streaming call")
-        try:
-            opus_data = await tts_service.synthesize_non_streaming(
-                text="Test audio validation.",
-                sample_rate=config.TTS_SOURCE_SAMPLE_RATE
-            )
-            # Validation successful, opus_data will be bytes
-            logger.info(f"{client.client_id}: Successfully validated Opus format")
-        except Exception as e:
-            logger.error(f"{client.client_id}: Failed to validate Opus format: {e}")
-            raise exceptions.ServiceError("Failed to validate TTS Opus format")
-
         # --- Initialization ---
         source_sr = config.TTS_SOURCE_SAMPLE_RATE # e.g., 24000 from OpenAI
         target_sr = config.TTS_SAMPLE_RATE       # e.g., 16000 for client
@@ -173,8 +174,8 @@ async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
         # Frame size in samples at TARGET rate (for encoder)
         frame_size_target = math.ceil(target_sr * frame_duration_ms / 1000)
 
-        logger.info(f"{client.client_id}: Initializing Resampling Pipeline (opuslib_next): {source_sr}Hz -> {target_sr}Hz")
-        logger.info(f"{client.client_id}: Source Frame Size (samples): {frame_size_source}, Target Frame Size (samples): {frame_size_target}")
+        logger.info(f"{client.client_id}: Initializing Resampling Pipeline: {source_sr}Hz -> {target_sr}Hz")
+        logger.info(f"{client.client_id}: Source Frame Size: {frame_size_source}, Target Frame Size: {frame_size_target}")
 
         # Decoder for incoming 24kHz Opus stream
         opus_decoder = opuslib_next.Decoder(source_sr, channels)
@@ -184,240 +185,143 @@ async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
             try:
                 bitrate = int(config.OPUS_BITRATE)
                 opus_encoder.bitrate = bitrate
-            except (ValueError, TypeError) as e:
-                logger.warning(f"{client.client_id}: Invalid OPUS_BITRATE value '{config.OPUS_BITRATE}', using default.")
-        opus_encoder.signal = opuslib_next.SIGNAL_VOICE # Optimize for voice
+                logger.info(f"{client.client_id}: Set Opus encoder bitrate to {bitrate} bps")
+            except ValueError:
+                logger.warning(f"{client.client_id}: Invalid OPUS_BITRATE: {config.OPUS_BITRATE}, using auto")
 
-        # Buffer for *resampled* 16k PCM data before encoding
-        pcm_16k_buffer = np.array([], dtype=np.int16)
-
-        # --- Start Streaming ---
-        tts_start_msg = protocol.create_tts_message(protocol.TTS_STATE_START)
-        logger.debug(f"{client.client_id}: Sending TTS Start: {tts_start_msg}")
-        await client.websocket.send(tts_start_msg)
-
-        chunk_count_in = 0
-        chunk_count_out = 0
-        stream_finished = False
-        opus_buffer = bytearray()  # Buffer to accumulate Opus data
-        min_opus_frame_size = 10  # Minimum size for a valid Opus frame
-        max_opus_frame_size = 1275  # Maximum size of an Opus frame (per spec)
-        accumulated_chunks = 0  # Count of accumulated chunks before processing
-
-        # Get the async generator from the TTS service
-        tts_generator = tts_service.synthesize(text_to_speak, sample_rate=source_sr) # Request source rate
-
-        while not stream_finished:
-            try:
-                # Check for cancellation *before* potentially blocking on receiving data
-                if client.tts_task is None or client.tts_task.cancelled():
-                    raise asyncio.CancelledError()
-
-                opus_chunk = await asyncio.wait_for(tts_generator.__anext__(), timeout=10.0)
-                if opus_chunk:
-                    opus_buffer.extend(opus_chunk)
-                    chunk_count_in += 1
-                    accumulated_chunks += 1
-                    logger.debug(f"{client.client_id}: Received chunk {chunk_count_in}: {len(opus_chunk)} bytes, buffer size: {len(opus_buffer)}")
-
-                # Try to process buffer when we have accumulated enough data or stream is finished
-                if len(opus_buffer) >= frame_size_source * 2 or (stream_finished and opus_buffer):
-                    logger.debug(f"{client.client_id}: Processing buffer of size {len(opus_buffer)} after {accumulated_chunks} chunks")
-                    accumulated_chunks = 0  # Reset counter
-
-                    while len(opus_buffer) >= min_opus_frame_size:
-                        try:
-                            # Try to decode the current buffer
-                            decoded_pcm_24k_bytes = opus_decoder.decode(bytes(opus_buffer), frame_size_source)
-                            decoded_pcm_24k = np.frombuffer(decoded_pcm_24k_bytes, dtype=np.int16)
-                            
-                            # If successful, clear the processed data
-                            opus_buffer.clear()
-                            
-                            # Resample 24kHz to 16kHz
-                            resampled_pcm_16k = resampy.resample(
-                                decoded_pcm_24k,
-                                sr_orig=source_sr,
-                                sr_new=target_sr,
-                                filter='kaiser_fast'
-                            ).astype(np.int16)
-                            
-                            # Add to the 16k buffer
-                            pcm_16k_buffer = np.concatenate((pcm_16k_buffer, resampled_pcm_16k))
-                            
-                        except OpusError as opus_err:
-                            if "buffer too small" in str(opus_err).lower():
-                                # Need more data, break inner loop and wait for more chunks
-                                break
-                            elif len(opus_buffer) > max_opus_frame_size:
-                                # Buffer is too large, might be corrupted - remove some data
-                                logger.warning(f"{client.client_id}: Buffer exceeded max size, discarding data")
-                                opus_buffer = opus_buffer[max_opus_frame_size:]
-                            else:
-                                # Try removing one byte to resync
-                                opus_buffer = opus_buffer[1:]
-                            continue
-                        
-                        # Process accumulated 16kHz PCM data
-                        while len(pcm_16k_buffer) >= frame_size_target:
-                            if client.tts_task is None or client.tts_task.cancelled():
-                                raise asyncio.CancelledError()
-
-                            # Get a frame's worth of PCM data
-                            pcm_frame = pcm_16k_buffer[:frame_size_target]
-                            pcm_16k_buffer = pcm_16k_buffer[frame_size_target:]
-
-                            try:
-                                # Encode to 16kHz Opus
-                                encoded_opus_16k = opus_encoder.encode(pcm_frame.tobytes(), frame_size_target)
-                                await client.websocket.send(encoded_opus_16k)
-                                chunk_count_out += 1
-                                await asyncio.sleep(0.005)
-                            except Exception as e:
-                                logger.error(f"{client.client_id}: Error encoding/sending 16k Opus: {e}")
-                                if isinstance(e, (websockets.exceptions.ConnectionClosed, asyncio.CancelledError)):
-                                    raise
-                                break
-
-            except StopAsyncIteration:
-                logger.info(f"{client.client_id}: TTS source stream finished.")
-                stream_finished = True
-            except asyncio.TimeoutError:
-                logger.warning(f"{client.client_id}: Timeout waiting for next TTS chunk.")
-                stream_finished = True
-            except asyncio.CancelledError:
-                logger.info(f"{client.client_id}: TTS streaming cancelled.")
-                raise
-            except Exception as e:
-                logger.error(f"{client.client_id}: Error in TTS streaming loop: {e}", exc_info=True)
-                stream_finished = True
-
-        # --- Stream Finished - Handle Remaining PCM Buffer ---
-        # NOTE: Incoming Opus buffer is no longer used/needed with per-chunk decoding
-        logger.info(f"{client.client_id}: Processing remaining {len(pcm_16k_buffer)} samples in PCM buffer.")
-
-        # Encode any remaining PCM data (padding if necessary)
-        if len(pcm_16k_buffer) > 0:
-            remaining_samples = len(pcm_16k_buffer)
-            padding_needed = frame_size_target - (remaining_samples % frame_size_target)
-            # Only pad if it's not already a multiple of the frame size
-            if padding_needed > 0 and padding_needed != frame_size_target :
-                 logger.debug(f"{client.client_id}: Padding final {remaining_samples} samples with {padding_needed} zeros.")
-                 padding = np.zeros(padding_needed, dtype=np.int16)
-                 pcm_16k_buffer = np.concatenate((pcm_16k_buffer, padding))
-            elif padding_needed == frame_size_target: # Means it's already a multiple
-                 pass # No padding needed
-            else: # remaining_samples % frame_size_target == 0
-                 pass # No padding needed
-
-            logger.debug(f"{client.client_id}: Encoding final {len(pcm_16k_buffer)} PCM samples (incl. padding).")
-            while len(pcm_16k_buffer) >= frame_size_target:
-                if client.tts_task is None or client.tts_task.cancelled(): raise asyncio.CancelledError()
-                pcm_frame = pcm_16k_buffer[:frame_size_target]
-                pcm_16k_buffer = pcm_16k_buffer[frame_size_target:]
+        # --- Stream TTS and process frames ---
+        try:
+            # Announce TTS start
+            tts_msg = protocol.create_tts_message(protocol.TTS_STATE_START)
+            await client.websocket.send(tts_msg)
+            
+            # Send sentence start with text
+            sentence_msg = protocol.create_tts_message(protocol.TTS_STATE_SENTENCE_START, text_to_speak)
+            await client.websocket.send(sentence_msg)
+            
+            # Get streaming TTS
+            async for chunk in tts_service.synthesize(text_to_speak, config.TTS_SOURCE_SAMPLE_RATE):
+                if not client.websocket.open or client.client_abort:
+                    logger.warning(f"{client.client_id}: Streaming interrupted - connection closed or aborted")
+                    break
+                
                 try:
-                    # Encode requires the number of samples per channel
-                    encoded_opus_16k = opus_encoder.encode(pcm_frame.tobytes(), frame_size_target)
-                    await client.websocket.send(encoded_opus_16k)
-                    chunk_count_out += 1
-                    await asyncio.sleep(0.005)
-                except OpusError as enc_err:
-                     logger.error(f"{client.client_id}: Opus encoding error on final buffer: {enc_err}", exc_info=True)
-                     # Break loop on final encoding error?
-                     break
-                except Exception as e:
-                     logger.error(f"{client.client_id}: Error sending final encoded chunk: {e}")
-                     # Break loop if sending fails
-                     if isinstance(e, (websockets.exceptions.ConnectionClosed, asyncio.CancelledError)): raise
-                     break # Stop trying to send on other errors
-
-        logger.info(f"{client.client_id}: Finished streaming. In chunks: {chunk_count_in}, Out chunks (16k Opus): {chunk_count_out}")
-
-        # --- Send TTS Stop ---
-        # Ensure stop is sent even if cancelled, unless connection is closed
-        if not client.websocket.closed:
-             tts_stop_msg = protocol.create_tts_message(protocol.TTS_STATE_STOP)
-             logger.debug(f"{client.client_id}: Sending TTS Stop.")
-             await client.websocket.send(tts_stop_msg)
-
-        # --- Update Client State ---
-        await client.stop_speaking(aborted=False)
-
-    except websockets.exceptions.ConnectionClosed:
-        logger.warning(f"{client.client_id}: Connection closed during TTS resampling pipeline.")
-        await client.stop_speaking(aborted=True)
+                    # Decode opus packet (TTS service output) at source rate
+                    pcm_samples = opus_decoder.decode(chunk, frame_size_source)
+                    
+                    # Resample from source to target rate
+                    resampled = resampy.resample(
+                        np.frombuffer(pcm_samples, dtype=np.int16),
+                        source_sr, target_sr
+                    )
+                    
+                    # Convert back to bytes for encoding
+                    resampled_bytes = resampled.astype(np.int16).tobytes()
+                    
+                    # Encode to target rate Opus
+                    target_opus = opus_encoder.encode(resampled_bytes, frame_size_target)
+                    
+                    # Send to client
+                    await client.websocket.send(target_opus)
+                    
+                except OpusError as e:
+                    logger.error(f"{client.client_id}: Opus processing error: {e}")
+                    continue
+                except asyncio.CancelledError:
+                    logger.info(f"{client.client_id}: TTS streaming cancelled")
+                    break
+                
+                # Check for cancelation between packets
+                await asyncio.sleep(0)
+                
+        except asyncio.CancelledError:
+            logger.info(f"{client.client_id}: TTS streaming cancelled during synthesis")
+            raise
+        except Exception as e:
+            logger.error(f"{client.client_id}: Error during TTS streaming: {e}", exc_info=True)
+            raise
+        
+        # Always send TTS stop message unless websocket is closed
+        if client.websocket.open:
+            try:
+                tts_stop_msg = protocol.create_tts_message(protocol.TTS_STATE_STOP)
+                await client.websocket.send(tts_stop_msg)
+            except Exception as e:
+                logger.error(f"{client.client_id}: Failed to send TTS stop message: {e}")
+    
     except asyncio.CancelledError:
-         logger.info(f"{client.client_id}: TTS resampling pipeline cancelled.")
-         # Try to send stop if possible, then update state
-         try:
-             if not client.websocket.closed:
-                 await client.websocket.send(protocol.create_tts_message(protocol.TTS_STATE_STOP))
-         except Exception: pass # Ignore errors during cancellation cleanup
-         await client.stop_speaking(aborted=True)
-         # Do not re-raise CancelledError here if it's handled gracefully
-         # Re-raise if the caller needs to know it was cancelled. Let's re-raise for now.
-         raise
+        logger.info(f"{client.client_id}: TTS Task cancelled")
+        raise
     except Exception as e:
-         logger.error(f"{client.client_id}: Error within TTS resampling pipeline: {e}", exc_info=True)
-         # Try to send stop message if possible
-         try:
-            if not client.websocket.closed:
-                 await client.websocket.send(protocol.create_tts_message(protocol.TTS_STATE_STOP))
-         except Exception: pass
-         await client.stop_speaking(aborted=True) # Mark as aborted due to error
-         # Re-raise exception for the main graph node or caller
-         raise
-
+        logger.error(f"{client.client_id}: TTS failed: {e}", exc_info=True)
+        if client.websocket.open:
+            try:
+                # Attempt to send TTS stop on error
+                stop_msg = protocol.create_tts_message(protocol.TTS_STATE_STOP)
+                await client.websocket.send(stop_msg)
+            except:
+                pass
     finally:
-        # opuslib_next's Encoder/Decoder don't have explicit close methods,
-        # rely on garbage collection.
-        opus_decoder = None
-        opus_encoder = None
-        logger.debug(f"{client.client_id}: Exiting TTS streaming coroutine.")
+        # Clean up resources
+        if opus_decoder:
+            try:
+                opus_decoder.destroy()
+            except:
+                pass
+        if opus_encoder:
+            try:
+                opus_encoder.destroy()
+            except:
+                pass
 
 
 # Main TTS streaming node
 async def run_tts_and_stream(state: AgentState) -> AgentState:
-    """Runs TTS and streams the audio back to the client (using resampling pipeline)."""
+    """Runs the TTS service to synthesize speech and streams it to the client."""
     client = state["client"]
-    response_text = state.get("llm_response_text")
-    error_message = state.get("error_message") # Get error from previous steps
-
-    text_to_speak = error_message if error_message else response_text
-
-    if not text_to_speak:
-        logger.warning(f"{client.client_id}: No text available for TTS (LLM response or error), session {client.session_id}. Ending turn.")
-        if client.state == ClientState.PROCESSING:
-             client.change_state(ClientState.IDLE)
-        return state # End the graph gracefully
-
-    logger.info(f"{client.client_id}: Starting TTS (with resampling) for session {client.session_id}")
-
-    # Create a task for the TTS streaming process
-    tts_stream_task = asyncio.create_task(
-        _perform_tts_streaming(client, text_to_speak), # Calls the modified function
-        name=f"TTS_{client.client_id}_{client.session_id}"
-    )
-    client.start_speaking(tts_stream_task) # Store task reference
-
+    logger.info(f"{client.client_id}: Running TTS for session {client.session_id}")
+    
     try:
-        await tts_stream_task # Await completion/cancellation/error
-        logger.info(f"{client.client_id}: TTS resampling task completed for session {client.session_id}")
-        state["error_message"] = None
-
-    except asyncio.CancelledError:
-         logger.warning(f"{client.client_id}: TTS resampling task was cancelled for session {client.session_id}")
-         state["error_message"] = "TTS playback was interrupted."
-    except exceptions.ServiceError as e: # Catch errors from the TTS service itself (e.g., API key)
-        logger.error(f"{client.client_id}: TTS Service Error during setup/streaming: {e}")
-        state["error_message"] = f"Sorry, I couldn't generate the audio response. ({e})"
-        # State should have been handled within _perform_tts_streaming's error block
-    except Exception as e: # Catch errors from resampling/encoding/sending
-        logger.error(f"{client.client_id}: Unexpected TTS pipeline Error: {e}", exc_info=True)
-        state["error_message"] = "An unexpected error occurred during audio playback processing."
-        # State should have been handled within _perform_tts_streaming's error block
-
-    # State transition IDLE handled within _perform_tts_streaming or stop_speaking
+        error_message = state.get("error_message")
+        llm_response = state.get("llm_response_text")
+        
+        # Decide what to speak (error message or LLM response)
+        text_to_speak = error_message if error_message else llm_response
+        
+        if not text_to_speak:
+            logger.warning(f"{client.client_id}: No text to speak, skipping TTS.")
+            client.change_state(ClientState.IDLE)
+            return state
+            
+        # Create and run the TTS streaming task
+        tts_task = asyncio.create_task(
+            _perform_tts_streaming(client, text_to_speak),
+            name=f"TTS_{client.client_id}_{client.session_id}"
+        )
+        
+        # Register the task with the client for potential cancellation
+        client.start_speaking(tts_task)
+        
+        # Wait for task to complete
+        try:
+            await tts_task
+            # If we get here, the task completed successfully
+            logger.info(f"{client.client_id}: TTS task completed successfully")
+            if client.state == ClientState.SPEAKING:
+                client.change_state(ClientState.IDLE)
+        except asyncio.CancelledError:
+            logger.info(f"{client.client_id}: TTS task was cancelled externally")
+            # TTS task cancellation is handled by stop_speaking method
+        except Exception as e:
+            logger.error(f"{client.client_id}: Error in TTS task: {e}", exc_info=True)
+            if client.state == ClientState.SPEAKING:
+                client.change_state(ClientState.IDLE)
+    
+    except Exception as e:
+        logger.error(f"{client.client_id}: Error in run_tts_and_stream: {e}", exc_info=True)
+        if client.state != ClientState.IDLE:
+            client.change_state(ClientState.IDLE)
+    
     return state
 
 # --- Conditional Edges ---

@@ -7,11 +7,34 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, Connecti
 from typing import Optional
 from app import config, protocol, exceptions
 from app.logger import logger
-from app.state_manager import client_manager, ClientState
+from app.state_manager import client_manager, ClientState, ConnectedClient
 from app.services.auth import auth_service
 from app.services.iot import iot_service
-from app.agent import app as agent_app, AgentState # Import the compiled graph and state type
+from app.services.tts import tts_service
+from app.agent import app as agent_app, AgentState, _perform_tts_streaming # Import the TTS streaming function
 import uuid
+import json
+import time
+import random
+
+# Helper function for creating listen messages
+def create_listen_message(state: str, mode: str = "manual") -> str:
+    """
+    Create a JSON listen message for the client.
+    
+    Args:
+        state: start, stop, detect
+        mode: manual, auto, realtime (only for start state)
+    """
+    msg = {
+        "type": protocol.TYPE_LISTEN,
+        "state": state
+    }
+    
+    if state == protocol.LISTEN_STATE_START and mode:
+        msg["mode"] = mode
+        
+    return json.dumps(msg)
 
 async def process_request(path: str, headers: Headers) -> Optional[tuple[int, Headers, bytes]]:
     """
@@ -145,7 +168,7 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                         state = data.get("state")
                         mode = data.get("mode") # auto, manual, realtime
                         if state == protocol.LISTEN_STATE_START:
-                            if client.state == ClientState.IDLE or client.state == ClientState.SPEAKING: # Can start listening from idle or after speaking
+                            if client.state == ClientState.IDLE or client.state == ClientState.SPEAKING or client.state == ClientState.LISTENING: # Can start listening from idle or after speaking
                                  # If speaking, abort current TTS first
                                  if client.state == ClientState.SPEAKING:
                                      logger.warning(f"{client.client_id}: Received listen:start while speaking. Aborting TTS.")
@@ -185,8 +208,14 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                         elif state == protocol.LISTEN_STATE_DETECT:
                             wake_word = data.get("text", "<unknown>")
                             logger.info(f"{client.client_id}: Received wake word detected: '{wake_word}'")
-                            # Action: Could potentially interrupt TTS like abort, or just log.
-                            # Client code seems to handle this before sending audio often.
+                            # Send a greeting TTS message when wake word is detected
+                            if client.state != ClientState.SPEAKING:
+                                # Create a greeting task
+                                greeting_task = asyncio.create_task(
+                                    send_wake_word_greeting(client),
+                                    name=f"WakeGreeting_{client.client_id}"
+                                )
+                            # Client will enter listening mode after the greeting
 
                         else:
                             logger.warning(f"{client.client_id}: Unknown listen state: {state}")
@@ -221,36 +250,69 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                         logger.warning(f"{client.client_id}: Received unknown message type: {msg_type}")
 
                 elif isinstance(message, bytes):
-                    # --- Handle Binary Message (Audio) ---
-                    # logger.debug(f"{client.client_id}: Received BINARY message: {len(message)} bytes")
-                    if client.state == ClientState.LISTENING:
-                        # Add to buffer as an individual opus packet
-                        should_process = client.add_audio_packet(message)
-                        
-                        # If in auto mode and packet processing indicates we should stop
-                        if should_process:
-                            # Stop listening and process audio
-                            client.stop_listening()
+                    # --- Handle Binary Message (Audio Data) ---
+                    # Only handle audio data in LISTENING state and if ASR is not in progress
+                    if client.state == ClientState.LISTENING and client.asr_server_receive:
+                        try:
+                            # Perform voice activity detection if enabled
+                            if config.VAD_ENABLED:
+                                # TODO: Implement VAD to measure energy/speech in audio packet
+                                has_voice = True  # Default implementation always assumes voice
+                                # Update client VAD state
+                                if has_voice and not client.client_have_voice:
+                                    # First voice detected
+                                    client.client_have_voice = True
+                                    logger.debug(f"{client.client_id}: Voice detected in audio packet")
+                                elif not has_voice and client.client_have_voice:
+                                    # Voice->silence transition
+                                    now = time.time()
+                                    client.client_no_voice_last_time = now
+                                    # Check if silence long enough to auto-stop
+                                    silence_duration_ms = config.VAD_SILENCE_DURATION_MS
+                                    if client.listen_mode == protocol.LISTEN_MODE_AUTO and \
+                                       now - client.client_no_voice_last_time > (silence_duration_ms / 1000):
+                                        client.client_voice_stop = True
+                                        logger.info(f"{client.client_id}: Auto-stopping after {silence_duration_ms}ms silence")
                             
-                            # Trigger the agent graph
-                            logger.info(f"{client.client_id}: Triggering agent graph for session {client.session_id}")
-                            initial_graph_state = AgentState(
-                                client=client,
-                                input_audio=client.audio_buffer.copy(),  # Pass copy of packet list
-                                asr_text=None,
-                                llm_response_text=None,
-                                llm_emotion=None,
-                                iot_commands_to_send=None,
-                                error_message=None,
-                                conversation_history=client.conversation_history # Pass current history
-                            )
-                            # Run the graph asynchronously
-                            asyncio.create_task(
-                                agent_app.ainvoke(initial_graph_state),
-                                name=f"AgentGraph_{client.client_id}_{client.session_id}"
-                            )
+                            # Add packet to buffer
+                            should_process = client.add_audio_packet(message)
+                            
+                            # Check if we should stop listening and process
+                            if client.client_voice_stop and len(client.audio_buffer) >= config.ASR_MIN_OPUS_PACKETS:
+                                # Switch to processing (to prevent more audio data during ASR)
+                                client.change_state(ClientState.PROCESSING)
+                                # Set processing flag to prevent more audio
+                                client.asr_server_receive = False
+                                
+                                # Trigger the agent graph async
+                                initial_graph_state = AgentState(
+                                    client=client,
+                                    input_audio=client.audio_buffer.copy(),  # Make a copy to prevent mutation
+                                    asr_text=None,
+                                    llm_response_text=None,
+                                    llm_emotion=None,
+                                    iot_commands_to_send=None,
+                                    error_message=None,
+                                    conversation_history=client.conversation_history
+                                )
+                                
+                                # Run agent graph in separate task
+                                asyncio.create_task(
+                                    agent_app.ainvoke(initial_graph_state),
+                                    name=f"AgentGraph_{client.client_id}_{client.session_id}"
+                                )
+                                
+                        except Exception as e:
+                            logger.error(f"{client.client_id}: Error handling audio data: {e}", exc_info=True)
+                            # In case of error, return to IDLE state
+                            client.change_state(ClientState.IDLE)
+                            client.reset_vad_states()
                     else:
-                        logger.warning(f"{client.client_id}: Received audio data in non-listening state: {client.state.name}. Discarding.")
+                        # Log a dropped message warning
+                        if client.state != ClientState.LISTENING:
+                            logger.warning(f"{client.client_id}: Dropped audio packet - not in LISTENING state (current: {client.state.name})")
+                        elif not client.asr_server_receive:
+                            logger.warning(f"{client.client_id}: Dropped audio packet - ASR processing in progress")
                 else:
                     logger.warning(f"{client.client_id}: Received unexpected message format: {type(message)}")
 
@@ -292,3 +354,46 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
              # If client object wasn't even created (e.g., handshake failed early)
              logger.info(f"Cleaning up failed connection attempt from {websocket.remote_address}")
         logger.info(f"Connection handler finished for {client_id}/{device_id}")
+
+async def send_wake_word_greeting(client: ConnectedClient):
+    """Send a greeting TTS message when wake word is detected."""
+    logger.info(f"{client.client_id}: Sending wake word greeting")
+    
+    # Get a random greeting from a selection
+    greetings = [
+        "Yes?",
+        "How can I help?",
+        "I'm listening.",
+        "What can I do for you?",
+        "How may I assist you?"
+    ]
+    greeting = random.choice(greetings)
+    
+    # Create TTS task for the greeting
+    try:
+        # Set client to speaking state
+        tts_task = asyncio.create_task(
+            _perform_tts_streaming(client, greeting),
+            name=f"WakeGreeting_{client.client_id}_{client.session_id}"
+        )
+        
+        client.start_speaking(tts_task)
+        
+        # Wait for the greeting to finish
+        await tts_task
+        
+        # After greeting finishes, automatically start listening
+        if client.state != ClientState.LISTENING:
+            client.start_listening(protocol.LISTEN_MODE_AUTO)
+            # Send listen start message to client
+            listen_msg = create_listen_message(protocol.LISTEN_STATE_START, protocol.LISTEN_MODE_AUTO)
+            await client.websocket.send(listen_msg)
+            logger.info(f"{client.client_id}: Started listening after wake word greeting")
+            
+    except asyncio.CancelledError:
+        logger.warning(f"{client.client_id}: Wake word greeting was cancelled")
+    except Exception as e:
+        logger.error(f"{client.client_id}: Error in wake word greeting: {e}", exc_info=True)
+        # Reset to IDLE on error
+        if client.state != ClientState.IDLE:
+            client.change_state(ClientState.IDLE)
