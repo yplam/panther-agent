@@ -57,13 +57,13 @@ async def forward_messages(source_ws: Any, target_ws: Any, direction: str):
                     await target_ws.send(message)
                 elif isinstance(message, bytes):
                     logger.debug(f"[{direction}] Forwarding BINARY from {source_addr} to {target_desc}: {len(message)} bytes")
-                    # try:
-                    #     pcm_frame = decoder.decode(message, 960)  # 960 samples = 60ms
-                    #     logger.debug(f"[{direction}] Decoded message: {len(pcm_frame)} bytes")
-                    # except Exception as e:
-                    #     logger.error(f"[{direction}] Error decoding message: {e}")
-                    #     pass
-                    await target_ws.send(pcm_frame)
+                    try:
+                        pcm_frame = decoder.decode(message, 960)  # 960 samples = 60ms
+                        logger.debug(f"[{direction}] Decoded message: {len(pcm_frame)} bytes")
+                    except Exception as e:
+                        logger.error(f"[{direction}] Error decoding message: {e}")
+                        pass
+                    await target_ws.send(message)
                 else:
                     logger.warning(f"[{direction}] Unknown message type from {source_addr}: {type(message)}")
 
