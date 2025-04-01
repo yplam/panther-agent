@@ -20,7 +20,7 @@ TARGET_URI = "wss://api.tenclass.net/xiaozhi/v1/"
 
 # --- Logging Setup ---
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s %(levelname)-8s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -53,13 +53,12 @@ async def forward_messages(source_ws: Any, target_ws: Any, direction: str):
         async for message in source_ws:
             try:
                 if isinstance(message, str):
-                    logger.debug(f"[{direction}] Forwarding TEXT from {source_addr} to {target_desc}: {message[:100]}{'...' if len(message)>100 else ''}")
+                    logger.info(f"[{direction}] TEXT: {message}")
                     await target_ws.send(message)
                 elif isinstance(message, bytes):
-                    logger.debug(f"[{direction}] Forwarding BINARY from {source_addr} to {target_desc}: {len(message)} bytes")
                     try:
                         pcm_frame = decoder.decode(message, 960)  # 960 samples = 60ms
-                        logger.debug(f"[{direction}] Decoded message: {len(pcm_frame)} bytes")
+                        logger.info(f"[{direction}] BINARY: {len(message)} bytes, Decoded Opus: {len(pcm_frame)} bytes")
                     except Exception as e:
                         logger.error(f"[{direction}] Error decoding message: {e}")
                         pass
@@ -103,7 +102,7 @@ async def proxy_handler(client_ws: WebSocketServerProtocol, path: str):
         header_value = client_ws.request_headers.get(header_name)
         if header_value:
             forward_headers[header_name] = header_value
-            logger.debug(f"Forwarding header {header_name}: {header_value}")
+            logger.info(f"Forwarding header {header_name}: {header_value}")
         else:
             logger.warning(f"Header '{header_name}' not found in client request from {client_addr}")
             missing_headers.append(header_name)
@@ -111,9 +110,9 @@ async def proxy_handler(client_ws: WebSocketServerProtocol, path: str):
     user_agent_header = client_ws.request_headers.get('User-Agent')
     if user_agent_header:
         forward_headers['User-Agent'] = user_agent_header
-        logger.debug(f"Forwarding User-Agent header: {user_agent_header}")
+        logger.info(f"Forwarding User-Agent header: {user_agent_header}")
     else:
-        logger.debug(f"User-Agent header not found in client request from {client_addr}. Not forwarding.")
+        logger.info(f"User-Agent header not found in client request from {client_addr}. Not forwarding.")
 
     target_ws: Optional[WebSocketClientProtocol] = None
     try:
@@ -130,10 +129,10 @@ async def proxy_handler(client_ws: WebSocketServerProtocol, path: str):
         logger.info(f"Connected to target {TARGET_URI} successfully for client {client_addr}")
 
         task_client_to_target = asyncio.create_task(
-            forward_messages(client_ws, target_ws, f"CLIENT->TARGET ({client_addr})")
+            forward_messages(client_ws, target_ws, f"CLIENT->SERVER")
         )
         task_target_to_client = asyncio.create_task(
-            forward_messages(target_ws, client_ws, f"TARGET->CLIENT ({client_addr})")
+            forward_messages(target_ws, client_ws, f"SERVER->CLIENT")
         )
 
         done, pending = await asyncio.wait(
@@ -142,7 +141,7 @@ async def proxy_handler(client_ws: WebSocketServerProtocol, path: str):
         )
 
         for task in pending:
-            logger.debug(f"Cancelling pending task for {client_addr}")
+            logger.info(f"Cancelling pending task for {client_addr}")
             task.cancel()
             try:
                 await task
