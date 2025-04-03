@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, Tuple, List, Dict, Any, Union, Optional
+import asyncio
 
 class BaseAuthService(ABC):
     @abstractmethod

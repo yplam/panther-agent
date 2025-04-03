@@ -13,13 +13,37 @@ IDLE_TIMEOUT_S = int(os.getenv("IDLE_TIMEOUT_S", 300)) # Timeout for inactive co
 # Authentication
 AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL") # Example: URL to verify token
 
-# AI Services (OpenAI Compatible Example)
+# Service Selection
+ASR_SERVICE = os.getenv("ASR_SERVICE", "openai")  # "openai" or "azure"
+TTS_SERVICE = os.getenv("TTS_SERVICE", "openai")  # "openai" or "azure"
+LLM_SERVICE = os.getenv("LLM_SERVICE", "openai")  # "openai" or "azure"
+
+# OpenAI Services
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") # Optional: For self-hosted/proxy
 ASR_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
+
+# Azure OpenAI Service (LLM)
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME", "gpt-4")
+
+# Azure Speech Service (ASR and TTS)
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+AZURE_SPEECH_RECOGNITION_LANGUAGE = os.getenv("AZURE_SPEECH_RECOGNITION_LANGUAGE", "en-US")
+AZURE_SPEECH_SYNTHESIS_LANGUAGE = os.getenv("AZURE_SPEECH_SYNTHESIS_LANGUAGE", "en-US")
+AZURE_TTS_VOICE = os.getenv("AZURE_TTS_VOICE", "en-US-JennyNeural")
+
+# Azure Text Analytics (for emotion detection)
+AZURE_TEXT_ANALYTICS_KEY = os.getenv("AZURE_TEXT_ANALYTICS_KEY")
+AZURE_TEXT_ANALYTICS_ENDPOINT = os.getenv("AZURE_TEXT_ANALYTICS_ENDPOINT")
+
+# Audio Config
 TTS_OUTPUT_FORMAT = "opus" # Must match spec
 TTS_SAMPLE_RATE = 16000 # Must match spec and server hello
 TTS_SOURCE_SAMPLE_RATE = 24000 # <--- Rate from OpenAI TTS

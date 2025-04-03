@@ -10,6 +10,10 @@ This server implements the backend for an ESP32-based AI voice assistant, handli
 *   Handles Opus audio input from the client.
 *   Orchestrates ASR -> LLM -> TTS flow using LangGraph.
 *   Integrates with OpenAI-compatible APIs for AI services (configurable).
+*   Supports Azure Cognitive Services as an alternative to OpenAI:
+    *   Azure Speech Service for ASR and TTS
+    *   Azure OpenAI Service for LLM
+    *   Azure Text Analytics for emotion detection
 *   Abstracted service layer for easy replacement of AI providers.
 *   Handles `listen`, `abort`, `iot` messages from the client.
 *   Sends `stt`, `llm`, `tts`, `iot` messages to the client.
@@ -53,13 +57,37 @@ This server implements the backend for an ESP32-based AI voice assistant, handli
     # Option 2: Remote Auth Service URL (Recommended for Production)
     # AUTH_SERVICE_URL=https://your-auth-service.com/verify
 
-    # --- AI Services (OpenAI Compatible Example) ---
+    # --- Service Selection ---
+    # Uncomment to use Azure services instead of OpenAI
+    # ASR_SERVICE=azure
+    # TTS_SERVICE=azure
+    # LLM_SERVICE=azure
+
+    # --- OpenAI Services ---
     OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     # OPENAI_BASE_URL= # Optional: For local models or proxies
     ASR_MODEL=whisper-1
     LLM_MODEL=gpt-4o # Or gpt-3.5-turbo, etc.
     TTS_MODEL=tts-1
     TTS_VOICE=alloy # Other options: echo, fable, onyx, nova, shimmer
+
+    # --- Azure Services ---
+    # Azure OpenAI Service (LLM)
+    # AZURE_OPENAI_KEY=your_azure_openai_key
+    # AZURE_OPENAI_ENDPOINT=https://your-resource-name.openai.azure.com
+    # AZURE_OPENAI_API_VERSION=2023-05-15
+    # AZURE_DEPLOYMENT_NAME=your-deployment-name
+
+    # Azure Speech Service (ASR and TTS)
+    # AZURE_SPEECH_KEY=your_azure_speech_key
+    # AZURE_SPEECH_REGION=eastus
+    # AZURE_SPEECH_RECOGNITION_LANGUAGE=en-US
+    # AZURE_SPEECH_SYNTHESIS_LANGUAGE=en-US
+    # AZURE_TTS_VOICE=en-US-JennyNeural
+
+    # Azure Text Analytics (for emotion detection with Azure LLM)
+    # AZURE_TEXT_ANALYTICS_KEY=your_azure_text_analytics_key
+    # AZURE_TEXT_ANALYTICS_ENDPOINT=https://your-resource-name.cognitiveservices.azure.com/
 
     # --- Logging ---
     LOG_LEVEL=INFO # DEBUG, INFO, WARNING, ERROR
@@ -111,3 +139,23 @@ This server implements the backend for an ESP32-based AI voice assistant, handli
 *   Implement checkpointing for LangGraph state if needed for recovery.
 *   Handle `listen:detect` messages more actively if required.
 *   Refine conversation history management within the AgentState.
+
+## Using Azure Cognitive Services
+
+The server supports using Azure Cognitive Services as an alternative to OpenAI:
+
+1. **Azure Speech Service for ASR and TTS**:
+   - Requires an Azure Speech Service resource
+   - Configure with AZURE_SPEECH_KEY and AZURE_SPEECH_REGION
+   - Set ASR_SERVICE=azure and/or TTS_SERVICE=azure to enable
+
+2. **Azure OpenAI Service for LLM**:
+   - Requires an Azure OpenAI Service resource with a deployed model
+   - Configure with AZURE_OPENAI_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_DEPLOYMENT_NAME
+   - Set LLM_SERVICE=azure to enable
+
+3. **Azure Text Analytics for Emotion Detection**:
+   - Optional, used with Azure LLM to determine emotion from responses
+   - Configure with AZURE_TEXT_ANALYTICS_KEY and AZURE_TEXT_ANALYTICS_ENDPOINT
+
+The services can be used independently - for example, you can use Azure Speech for ASR/TTS while still using OpenAI for the LLM component, or any other combination.

@@ -14,9 +14,13 @@ from app.logger import logger
 from app.services.asr import asr_service
 from app.services.llm import llm_service
 from app.services.tts import tts_service
-from app.services.iot import iot_service # Using the in-memory version
+from app.services.iot import iot_service
 from app.state_manager import ConnectedClient, ClientState
-import websockets
+
+# Constants for client audio parameters
+CLIENT_SAMPLE_RATE = 16000
+CLIENT_CHANNELS = 1
+OPUS_FRAME_MS = 60
 
 # Function to create listen messages (used in websocket_handler)
 def create_listen_message(state: str, mode: str = "manual") -> str:
@@ -63,7 +67,10 @@ async def run_asr(state: AgentState) -> AgentState:
         state["error_message"] = None
 
         # Send STT result back to client
-        stt_msg = protocol.create_stt_message(transcription if transcription else "<no speech detected>")
+        stt_msg = protocol.create_stt_message(
+            transcription if transcription else "<no speech detected>",
+            client.session_id  # Include session_id in the message
+        )
         logger.debug(f"{client.client_id}: Sending STT: {stt_msg}")
         await client.websocket.send(stt_msg)
 
@@ -110,7 +117,7 @@ async def run_llm(state: AgentState) -> AgentState:
 
         # Send LLM emotion
         if emotion:
-            llm_msg = protocol.create_llm_emotion_message(emotion)
+            llm_msg = protocol.create_llm_emotion_message(emotion, client.session_id)
             logger.debug(f"{client.client_id}: Sending LLM emotion: {llm_msg}")
             await client.websocket.send(llm_msg)
 
@@ -141,7 +148,7 @@ async def send_iot_commands(state: AgentState) -> AgentState:
     if commands:
         logger.info(f"{client.client_id}: Sending IoT commands for session {client.session_id}: {commands}")
         try:
-            iot_msg = protocol.create_iot_command_message(commands)
+            iot_msg = protocol.create_iot_command_message(commands, client.session_id)
             logger.debug(f"{client.client_id}: Sending IoT: {iot_msg}")
             await client.websocket.send(iot_msg)
             # Optionally wait for client ACK or handle potential errors?
@@ -159,16 +166,16 @@ async def send_iot_commands(state: AgentState) -> AgentState:
 async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
     """
     Helper coroutine to handle TTS streaming WITH resampling using opuslib_next.
-    Receives 24kHz Opus -> Decodes -> Resamples to 16kHz -> Encodes to 16kHz Opus -> Streams.
+    Handles TTS output -> resampling if needed -> encoding to client Opus format.
     """
     opus_decoder = None
     opus_encoder = None
     try:
         # --- Initialization ---
         source_sr = config.TTS_SOURCE_SAMPLE_RATE # e.g., 24000 from OpenAI
-        target_sr = config.TTS_SAMPLE_RATE       # e.g., 16000 for client
-        channels = 1
-        frame_duration_ms = config.OPUS_FRAME_MS
+        target_sr = CLIENT_SAMPLE_RATE  # Always use 16000 Hz for client
+        channels = CLIENT_CHANNELS
+        frame_duration_ms = OPUS_FRAME_MS
         # Frame size in samples at SOURCE rate (for decoder)
         frame_size_source = math.ceil(source_sr * frame_duration_ms / 1000)
         # Frame size in samples at TARGET rate (for encoder)
@@ -177,9 +184,9 @@ async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
         logger.info(f"{client.client_id}: Initializing Resampling Pipeline: {source_sr}Hz -> {target_sr}Hz")
         logger.info(f"{client.client_id}: Source Frame Size: {frame_size_source}, Target Frame Size: {frame_size_target}")
 
-        # Decoder for incoming 24kHz Opus stream
+        # Decoder for incoming source rate Opus stream from TTS
         opus_decoder = opuslib_next.Decoder(source_sr, channels)
-        # Encoder for outgoing 16kHz Opus stream
+        # Encoder for outgoing target rate Opus stream to client
         opus_encoder = opuslib_next.Encoder(target_sr, channels, opuslib_next.APPLICATION_AUDIO)
         if config.OPUS_BITRATE != "auto":
             try:
@@ -191,16 +198,16 @@ async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
 
         # --- Stream TTS and process frames ---
         try:
-            # Announce TTS start
-            tts_msg = protocol.create_tts_message(protocol.TTS_STATE_START)
+            # Announce TTS start with client sample rate
+            tts_msg = protocol.create_tts_message(protocol.TTS_STATE_START, sample_rate=target_sr, session_id=client.session_id)
             await client.websocket.send(tts_msg)
             
             # Send sentence start with text
-            sentence_msg = protocol.create_tts_message(protocol.TTS_STATE_SENTENCE_START, text_to_speak)
+            sentence_msg = protocol.create_tts_message(protocol.TTS_STATE_SENTENCE_START, text=text_to_speak, session_id=client.session_id)
             await client.websocket.send(sentence_msg)
             
             # Get streaming TTS
-            async for chunk in tts_service.synthesize(text_to_speak, config.TTS_SOURCE_SAMPLE_RATE):
+            async for chunk in tts_service.synthesize(text_to_speak, source_sr):
                 if not client.websocket.open or client.client_abort:
                     logger.warning(f"{client.client_id}: Streaming interrupted - connection closed or aborted")
                     break
@@ -241,10 +248,18 @@ async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
             logger.error(f"{client.client_id}: Error during TTS streaming: {e}", exc_info=True)
             raise
         
+        # Send sentence end message if available
+        if client.websocket.open:
+            try:
+                sentence_end_msg = protocol.create_tts_message(protocol.TTS_STATE_SENTENCE_END, text=text_to_speak, session_id=client.session_id)
+                await client.websocket.send(sentence_end_msg)
+            except Exception as e:
+                logger.error(f"{client.client_id}: Failed to send sentence end message: {e}")
+
         # Always send TTS stop message unless websocket is closed
         if client.websocket.open:
             try:
-                tts_stop_msg = protocol.create_tts_message(protocol.TTS_STATE_STOP)
+                tts_stop_msg = protocol.create_tts_message(protocol.TTS_STATE_STOP, session_id=client.session_id)
                 await client.websocket.send(tts_stop_msg)
             except Exception as e:
                 logger.error(f"{client.client_id}: Failed to send TTS stop message: {e}")
@@ -257,7 +272,7 @@ async def _perform_tts_streaming(client: ConnectedClient, text_to_speak: str):
         if client.websocket.open:
             try:
                 # Attempt to send TTS stop on error
-                stop_msg = protocol.create_tts_message(protocol.TTS_STATE_STOP)
+                stop_msg = protocol.create_tts_message(protocol.TTS_STATE_STOP, session_id=client.session_id)
                 await client.websocket.send(stop_msg)
             except:
                 pass

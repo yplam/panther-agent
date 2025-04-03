@@ -117,10 +117,27 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                 raise exceptions.ProtocolError(f"Invalid or missing client 'hello': {client_hello_raw[:100]}")
 
             logger.info(f"{client.client_id}: Received client 'hello': {client_hello}")
-            # TODO: Validate client_hello contents further if needed (version, audio_params)
+            
+            # Extract and store client audio parameters if available
+            if "audio_params" in client_hello:
+                audio_params = client_hello.get("audio_params", {})
+                client_sample_rate = audio_params.get("sample_rate", protocol.AUDIO_SAMPLE_RATE_16K)
+                client_channels = audio_params.get("channels", protocol.AUDIO_CHANNELS_MONO)
+                client_frame_duration = audio_params.get("frame_duration", 60)
+                logger.info(f"{client.client_id}: Client audio params: {client_sample_rate}Hz, {client_channels}ch, {client_frame_duration}ms frames")
+                
+                # Store these values in client object if needed
+                # client.audio_sample_rate = client_sample_rate
+                # client.audio_channels = client_channels
+                # client.audio_frame_duration = client_frame_duration
 
-            # Send server hello
-            server_hello = protocol.create_server_hello(config.TTS_SAMPLE_RATE) # Use configured TTS rate
+            # Generate a session ID for this connection
+            session_id = str(uuid.uuid4())[:8]  # Use first 8 chars of a UUID
+            client.session_id = session_id
+            logger.info(f"{client.client_id}: Assigned session ID: {session_id}")
+
+            # Send server hello with the session ID
+            server_hello = protocol.create_server_hello(session_id, protocol.AUDIO_SAMPLE_RATE_16K)  # Always use 16kHz
             logger.info(f"{client.client_id}: Sending server 'hello': {server_hello}")
             await websocket.send(server_hello)
             client.change_state(ClientState.IDLE) # Handshake complete, ready
@@ -155,14 +172,9 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
 
                     msg_type = data.get("type")
 
-                    # Update conversation history if message has 'session_id' and matches current
-                    # Note: Client code sends "" as session_id. Server generates it.
-                    # This check might not be useful unless client starts sending it.
-                    # msg_session_id = data.get("session_id")
-                    # if msg_session_id and msg_session_id != client.session_id:
-                    #      logger.warning(f"{client.client_id}: Received message with mismatched session_id. Ignoring? Current: {client.session_id}, Received: {msg_session_id}")
-                    #      continue # Or handle appropriately
-
+                    # Client may send empty session ID or omit it completely - this is normal per protocol
+                    # msg_session_id = data.get("session_id", "")
+                    # logger.debug(f"{client.client_id}: Message session_id: '{msg_session_id}', server session_id: '{client.session_id}'")
 
                     if msg_type == protocol.TYPE_LISTEN:
                         state = data.get("state")
@@ -213,7 +225,7 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                                 # Create a greeting task
                                 greeting_task = asyncio.create_task(
                                     send_wake_word_greeting(client),
-                                    name=f"WakeGreeting_{client.client_id}"
+                                    name=f"WakeGreeting_{client.client_id}_{client.session_id}"
                                 )
                             # Client will enter listening mode after the greeting
 
