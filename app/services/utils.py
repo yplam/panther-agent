@@ -88,11 +88,11 @@ def get_azure_speech_config() -> SpeechConfig:
     try:
         speech_config = SpeechConfig(subscription=config.AZURE_SPEECH_KEY, region=config.AZURE_SPEECH_REGION)
         
-        # Set additional properties if needed
-        speech_config.speech_recognition_language = getattr(config, "AZURE_SPEECH_RECOGNITION_LANGUAGE", "en-US")
-        speech_config.speech_synthesis_language = getattr(config, "AZURE_SPEECH_SYNTHESIS_LANGUAGE", "en-US")
+        # Set language properties using the updated settings
+        speech_config.speech_recognition_language = getattr(config, "AZURE_SPEECH_RECOGNITION_LANGUAGE", config.DEFAULT_LANGUAGE)
+        speech_config.speech_synthesis_language = getattr(config, "AZURE_SPEECH_SYNTHESIS_LANGUAGE", config.DEFAULT_LANGUAGE)
         
-        logger.info(f"Azure Speech config created for region {config.AZURE_SPEECH_REGION}")
+        logger.info(f"Azure Speech config created for region {config.AZURE_SPEECH_REGION} with language {speech_config.speech_recognition_language}")
         return speech_config
     except Exception as e:
         logger.error(f"Failed to initialize Azure Speech config: {e}", exc_info=True)

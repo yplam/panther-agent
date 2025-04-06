@@ -25,6 +25,8 @@ class OpenAIASRService(BaseASRService):
         self.output_dir = config.AUDIO_OUTPUT_DIR if hasattr(config, "AUDIO_OUTPUT_DIR") else "audio_files"
         # Ensure output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
+        # Initialize streaming buffer for continuous speech recognition
+        self.streaming_buffer = {}  # client_id -> audio buffer
 
     @staticmethod
     def decode_opus(opus_data: List[bytes]) -> bytes:
@@ -59,11 +61,17 @@ class OpenAIASRService(BaseASRService):
         logger.info(f"Saved audio to {file_path}")
         return file_path
 
-    async def transcribe(self, audio_data: bytes, content_type: str = "audio/opus") -> str:
+    async def transcribe(self, audio_data: bytes, content_type: str = "audio/opus", streaming: bool = False, client_id: Optional[str] = None) -> str:
         """
         Transcribe audio data.
         If audio_data is a list of opus packets, decode them first.
         If content_type is "audio/opus", treat as a single opus stream.
+        
+        Args:
+            audio_data: Raw audio data or list of opus packets
+            content_type: MIME type of audio
+            streaming: Whether to use streaming mode
+            client_id: Client ID for streaming buffer management
         """
         if isinstance(audio_data, list):
             # Handle list of opus packets from buffering
@@ -97,7 +105,8 @@ class OpenAIASRService(BaseASRService):
             response = await self.client.audio.transcriptions.create(
                 model=config.ASR_MODEL,
                 file=audio_file,
-                response_format="text"  # Get plain text directly
+                response_format="text",  # Get plain text directly
+                language=getattr(config, "ASR_LANGUAGE", "zh")  # Use Chinese as the language
             )
             
             # The response object itself is the transcribed text when response_format="text"
@@ -110,6 +119,50 @@ class OpenAIASRService(BaseASRService):
         except Exception as e:
             logger.error(f"ASR service error: {e}", exc_info=True)
             raise exceptions.ServiceError(f"ASR failed: {e}")
+            
+    async def process_audio_stream(self, client_id: str, session_id: str, opus_packet: bytes) -> Optional[str]:
+        """
+        Process a single Opus packet in a streaming fashion.
+        Returns transcription text if speech is detected, None otherwise.
+        
+        This implements a simplified streaming ASR approach:
+        1. Buffer audio packets until we have enough data
+        2. Periodically check for speech and transcribe if detected
+        3. Reset buffer after processing
+        
+        Args:
+            client_id: ID of the client
+            session_id: Current session ID
+            opus_packet: Single Opus packet of audio data
+            
+        Returns:
+            Transcription text if speech detected, None otherwise
+        """
+        # Initialize buffer for this client if needed
+        if client_id not in self.streaming_buffer:
+            self.streaming_buffer[client_id] = []
+            
+        # Add packet to buffer
+        self.streaming_buffer[client_id].append(opus_packet)
+        
+        # Check if we have enough data to process (e.g., 1 second of audio)
+        # With 60ms frames, 16-17 packets = ~1 second
+        if len(self.streaming_buffer[client_id]) >= 16:
+            # Process the buffered packets
+            buffer_copy = self.streaming_buffer[client_id].copy()
+            
+            # Clear buffer to allow new audio to accumulate while processing
+            self.streaming_buffer[client_id] = []
+            
+            # Process the audio
+            try:
+                transcription = await self.transcribe(buffer_copy)
+                if transcription:
+                    return transcription
+            except Exception as e:
+                logger.error(f"Streaming ASR error for client {client_id}: {e}")
+        
+        return None
 
 
 class AzureASRService(BaseASRService):

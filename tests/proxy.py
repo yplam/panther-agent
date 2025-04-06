@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import ssl
+import os
 from typing import Optional, Dict, Any
 import certifi
 import opuslib_next
@@ -17,14 +18,24 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8765
 LISTEN_PATH = "/xiaozhi/v1/"
 TARGET_URI = "wss://api.tenclass.net/xiaozhi/v1/"
+LOG_FILE = "proxy.log"  # Log file name
 
 # --- Logging Setup ---
+log_directory = "logs"
+os.makedirs(log_directory, exist_ok=True)
+log_file_path = os.path.join(log_directory, LOG_FILE)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)-8s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(log_file_path),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger("websocket_proxy")
+logger.info(f"Logging to file: {log_file_path}")
 
 # --- Constants ---
 EXPECTED_HEADERS = [
@@ -49,22 +60,76 @@ async def forward_messages(source_ws: Any, target_ws: Any, direction: str):
     source_addr = source_ws.remote_address if hasattr(source_ws, 'remote_address') else 'N/A'
     target_desc = getattr(target_ws, 'host', 'Target') + ':' + str(getattr(target_ws, 'port', 'N/A'))
     decoder = opuslib_next.Decoder(16000, 1)  # 16kHz, 单声道
+    
+    # State tracking for binary message compression
+    binary_count = 0
+    consecutive_binary = False
+    max_logged_binary = 3  # Number of messages to log at start and end
+    binary_buffer = []  # Buffer to store recent binary messages for end logging
+    buffer_size = max_logged_binary  # Size of the buffer for last N messages
+    abbreviated = False  # Flag to track if we've shown the abbreviation message
+    
     try:
         async for message in source_ws:
             try:
                 if isinstance(message, str):
+                    # If we were receiving binary before, log the last few binary messages
+                    if consecutive_binary and binary_count > max_logged_binary and binary_buffer:
+                        logger.info(f"[{direction}] ... last {len(binary_buffer)} audio messages:")
+                        for i, (msg_len, pcm_len) in enumerate(binary_buffer):
+                            logger.info(f"[{direction}] BINARY: {msg_len} bytes, Decoded Opus: {pcm_len} bytes")
+                    
+                    # Reset binary tracking
+                    binary_count = 0
+                    consecutive_binary = False
+                    abbreviated = False
+                    binary_buffer = []
+                    
                     logger.info(f"[{direction}] TEXT: {message}")
                     await target_ws.send(message)
                 elif isinstance(message, bytes):
+                    binary_count += 1
+                    
                     try:
                         pcm_frame = decoder.decode(message, 960)  # 960 samples = 60ms
-                        logger.info(f"[{direction}] BINARY: {len(message)} bytes, Decoded Opus: {len(pcm_frame)} bytes")
+                        pcm_length = len(pcm_frame)
+                        
+                        # Keep track of recent binary messages
+                        if len(binary_buffer) >= buffer_size:
+                            binary_buffer.pop(0)  # Remove oldest
+                        binary_buffer.append((len(message), pcm_length))
+                        
+                        # Determine if we should log this binary message in detail
+                        if binary_count <= max_logged_binary:
+                            # First few messages are always logged
+                            logger.info(f"[{direction}] BINARY: {len(message)} bytes, Decoded Opus: {pcm_length} bytes")
+                            consecutive_binary = True
+                        elif not abbreviated:
+                            # Show abbreviation message only once
+                            logger.info(f"[{direction}] ... more audio data follows ...")
+                            abbreviated = True
+                            consecutive_binary = True
                     except Exception as e:
+                        # Always log decoding errors fully
                         logger.error(f"[{direction}] Error decoding message: {e}")
-                        pass
+                        consecutive_binary = False
+                        binary_count = 0
+                        abbreviated = False
+                        binary_buffer = []
+                    
                     await target_ws.send(message)
                 else:
+                    # If we were receiving binary before, log the last few binary messages
+                    if consecutive_binary and binary_count > max_logged_binary and binary_buffer:
+                        logger.info(f"[{direction}] ... last {len(binary_buffer)} audio messages:")
+                        for i, (msg_len, pcm_len) in enumerate(binary_buffer):
+                            logger.info(f"[{direction}] BINARY: {msg_len} bytes, Decoded Opus: {pcm_len} bytes")
+                    
                     logger.warning(f"[{direction}] Unknown message type from {source_addr}: {type(message)}")
+                    consecutive_binary = False
+                    binary_count = 0
+                    abbreviated = False
+                    binary_buffer = []
 
             except ConnectionClosed:
                 logger.info(f"[{direction}] Target connection {target_desc} closed while sending.")
@@ -72,6 +137,12 @@ async def forward_messages(source_ws: Any, target_ws: Any, direction: str):
             except Exception as e:
                 logger.error(f"[{direction}] Error sending message to {target_desc}: {e}")
                 break
+                
+        # If the loop ends normally and we were receiving binary, log the final messages
+        if consecutive_binary and binary_count > max_logged_binary and binary_buffer:
+            logger.info(f"[{direction}] ... last {len(binary_buffer)} audio messages:")
+            for i, (msg_len, pcm_len) in enumerate(binary_buffer):
+                logger.info(f"[{direction}] BINARY: {msg_len} bytes, Decoded Opus: {pcm_len} bytes")
     except ConnectionClosedOK:
         logger.info(f"[{direction}] Source connection {source_addr} closed gracefully.")
     except ConnectionClosedError as e:

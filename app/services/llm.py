@@ -61,8 +61,8 @@ class OpenAILLMService(BaseLLMService):
 
         logger.info(f"Sending prompt to LLM ({config.LLM_MODEL}): '{prompt}'")
         messages = []
-        # Basic System Prompt - Enhance this significantly!
-        messages.append({"role": "system", "content": "You are a helpful voice assistant. Respond concisely. Infer emotion (neutral, happy, sad, thinking, worried) and respond in JSON format: {\"response\": \"Your text response\", \"emotion\": \"detected_emotion\"}. Only use the provided tools if necessary."})
+        # Updated System Prompt to use Chinese
+        messages.append({"role": "system", "content": "你是一个有帮助的中文语音助手。请简洁回答。推断情绪（neutral、happy、sad、thinking、worried）并以JSON格式响应：{\"response\": \"你的文本回答\", \"emotion\": \"检测到的情绪\"}。只在必要时使用提供的工具。"})
 
         if history:
             messages.extend(history)
@@ -80,7 +80,7 @@ class OpenAILLMService(BaseLLMService):
             )
 
             response_message = completion.choices[0].message
-            response_text = "Sorry, I couldn't process that."
+            response_text = "抱歉，我无法处理这个请求。"
             emotion = "neutral"
             iot_commands = None
 
@@ -118,7 +118,7 @@ class OpenAILLMService(BaseLLMService):
                             # Attempt to parse the follow-up response JSON
                             try:
                                 content_json = json.loads(follow_up_message)
-                                response_text = content_json.get("response", "Okay, done.")
+                                response_text = content_json.get("response", "好的，已完成。")
                                 emotion = content_json.get("emotion", "neutral")
                             except json.JSONDecodeError:
                                 logger.warning(f"LLM follow-up response was not valid JSON: {follow_up_message}")
@@ -127,21 +127,21 @@ class OpenAILLMService(BaseLLMService):
                         else:
                              logger.warning("IoT command requested but no commands found or device_id missing.")
                              # Fallback to generating a normal response without tool call
-                             response_text = "I can't control devices right now."
+                             response_text = "抱歉，我现在无法控制设备。"
                              emotion = "sad"
 
                     except json.JSONDecodeError as json_err:
                         logger.error(f"Failed to parse LLM tool arguments: {json_err}")
-                        response_text = "There was an issue processing the device command."
+                        response_text = "处理设备命令时出现问题。"
                         emotion = "sad"
                     except Exception as e:
                          logger.error(f"Error processing tool call: {e}")
-                         response_text = "Something went wrong with the device control."
+                         response_text = "设备控制出现问题。"
                          emotion = "sad"
                 else:
                     logger.warning(f"Unhandled tool call: {tool_call.function.name}")
                     # Fallback if an unexpected tool is called
-                    response_text = "I received an unexpected request."
+                    response_text = "我收到了一个意外的请求。"
                     emotion = "worried"
 
             # No tool calls, process normal response
@@ -150,7 +150,7 @@ class OpenAILLMService(BaseLLMService):
                 # Attempt to parse the response JSON directly
                 try:
                     content_json = json.loads(raw_content)
-                    response_text = content_json.get("response", "Sorry, I had trouble formulating a response.")
+                    response_text = content_json.get("response", "抱歉，我在组织回答时遇到了困难。")
                     emotion = content_json.get("emotion", "neutral")
                 except json.JSONDecodeError:
                     logger.warning(f"LLM response was not valid JSON: {raw_content}")
@@ -239,8 +239,8 @@ class AzureLLMService(BaseLLMService):
 
         logger.info(f"Sending prompt to Azure OpenAI ({config.AZURE_DEPLOYMENT_NAME}): '{prompt}'")
         messages = []
-        # Basic System Prompt - Enhance this significantly!
-        messages.append({"role": "system", "content": "You are a helpful voice assistant. Respond concisely."})
+        # Updated System Prompt for Chinese
+        messages.append({"role": "system", "content": "你是一个有帮助的中文语音助手。请简洁回答。"})
 
         if history:
             messages.extend(history)
@@ -256,7 +256,7 @@ class AzureLLMService(BaseLLMService):
             )
 
             response_message = completion.choices[0].message
-            response_text = "Sorry, I couldn't process that."
+            response_text = "抱歉，我无法处理这个请求。"
             emotion = "neutral"
             iot_commands = None
 
@@ -295,21 +295,21 @@ class AzureLLMService(BaseLLMService):
                         else:
                              logger.warning("IoT command requested but no commands found or device_id missing.")
                              # Fallback to generating a normal response without tool call
-                             response_text = "I can't control devices right now."
+                             response_text = "抱歉，我现在无法控制设备。"
                              emotion = "sad"
 
                     except json.JSONDecodeError as json_err:
                         logger.error(f"Failed to parse Azure LLM tool arguments: {json_err}")
-                        response_text = "There was an issue processing the device command."
+                        response_text = "处理设备命令时出现问题。"
                         emotion = "sad"
                     except Exception as e:
                          logger.error(f"Error processing tool call: {e}")
-                         response_text = "Something went wrong with the device control."
+                         response_text = "设备控制出现问题。"
                          emotion = "sad"
                 else:
                     logger.warning(f"Unhandled tool call: {tool_call.function.name}")
                     # Fallback if an unexpected tool is called
-                    response_text = "I received an unexpected request."
+                    response_text = "我收到了一个意外的请求。"
                     emotion = "worried"
 
             # No tool calls, process normal response

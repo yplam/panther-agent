@@ -11,7 +11,7 @@ from app.state_manager import client_manager, ClientState, ConnectedClient
 from app.services.auth import auth_service
 from app.services.iot import iot_service
 from app.services.tts import tts_service
-from app.agent import app as agent_app, AgentState, _perform_tts_streaming # Import the TTS streaming function
+from app.agent import app as agent_app, AgentState, process_incoming_audio, _perform_tts_streaming  # Import process_incoming_audio
 import uuid
 import json
 import time
@@ -203,7 +203,9 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                                          llm_emotion=None,
                                          iot_commands_to_send=None,
                                          error_message=None,
-                                         conversation_history=client.conversation_history # Pass current history
+                                         conversation_history=client.conversation_history,
+                                         listening_mode=client.listen_mode if client.listen_mode else "manual",
+                                         is_streaming_asr=False
                                      )
                                      # Run the graph asynchronously
                                      asyncio.create_task(
@@ -218,16 +220,34 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                                 logger.warning(f"{client.client_id}: Received listen:stop in unexpected state: {client.state.name}. Ignoring.")
 
                         elif state == protocol.LISTEN_STATE_DETECT:
-                            wake_word = data.get("text", "<unknown>")
-                            logger.info(f"{client.client_id}: Received wake word detected: '{wake_word}'")
-                            # Send a greeting TTS message when wake word is detected
-                            if client.state != ClientState.SPEAKING:
-                                # Create a greeting task
-                                greeting_task = asyncio.create_task(
-                                    send_wake_word_greeting(client),
-                                    name=f"WakeGreeting_{client.client_id}_{client.session_id}"
+                            # This is a direct transcription from wake word detection
+                            # Process it immediately without waiting for more audio
+                            wake_word_text = data.get("text", "")
+                            if wake_word_text:
+                                logger.info(f"{client.client_id}: Got wake word detection text: {wake_word_text}")
+                                # Start a conversation directly based on this transcription
+                                client.change_state(ClientState.PROCESSING)
+                                
+                                # Add this text to history
+                                client.conversation_history.append({"role": "user", "content": wake_word_text})
+                                
+                                # Trigger agent graph
+                                initial_graph_state = AgentState(
+                                    client=client,
+                                    input_audio=[],  # Empty since we already have the text
+                                    asr_text=wake_word_text,  # Use the detected text directly
+                                    llm_response_text=None,
+                                    llm_emotion=None,
+                                    iot_commands_to_send=None,
+                                    error_message=None,
+                                    conversation_history=client.conversation_history,
+                                    listening_mode="detect",
+                                    is_streaming_asr=False
                                 )
-                            # Client will enter listening mode after the greeting
+                                asyncio.create_task(
+                                    agent_app.ainvoke(initial_graph_state),
+                                    name=f"AgentGraph_{client.client_id}_{client.session_id}"
+                                )
 
                         else:
                             logger.warning(f"{client.client_id}: Unknown listen state: {state}")
@@ -289,8 +309,42 @@ async def handle_connection(websocket: WebSocketServerProtocol, path: str):
                             # Add packet to buffer
                             should_process = client.add_audio_packet(message)
                             
-                            # Check if we should stop listening and process
-                            if client.client_voice_stop and len(client.audio_buffer) >= config.ASR_MIN_OPUS_PACKETS:
+                            # If streaming ASR is enabled, process each packet individually
+                            if client.listen_mode == protocol.LISTEN_MODE_AUTO or client.listen_mode == protocol.LISTEN_MODE_REALTIME:
+                                # Process audio packet in streaming mode
+                                try:
+                                    transcription = await process_incoming_audio(client, message)
+                                    if transcription:
+                                        # We got a transcription from streaming ASR, stop listening and trigger agent
+                                        logger.info(f"{client.client_id}: Streaming ASR detected speech: {transcription}")
+                                        client.stop_listening()
+                                        
+                                        # Create and invoke agent with the detected speech
+                                        initial_graph_state = AgentState(
+                                            client=client,
+                                            input_audio=client.audio_buffer.copy(),
+                                            asr_text=transcription,  # Already transcribed
+                                            llm_response_text=None,
+                                            llm_emotion=None,
+                                            iot_commands_to_send=None,
+                                            error_message=None,
+                                            conversation_history=client.conversation_history,
+                                            listening_mode=client.listen_mode,
+                                            is_streaming_asr=True
+                                        )
+                                        # Add the transcription to history
+                                        client.conversation_history.append({"role": "user", "content": transcription})
+                                        
+                                        # Run the graph asynchronously
+                                        asyncio.create_task(
+                                            agent_app.ainvoke(initial_graph_state),
+                                            name=f"StreamingASR_{client.client_id}_{client.session_id}"
+                                        )
+                                except Exception as e:
+                                    logger.error(f"{client.client_id}: Error in streaming ASR: {e}", exc_info=True)
+                            
+                            # If not streaming or streaming didn't trigger, check if should process the whole buffer
+                            if should_process:
                                 # Switch to processing (to prevent more audio data during ASR)
                                 client.change_state(ClientState.PROCESSING)
                                 # Set processing flag to prevent more audio
@@ -373,11 +427,11 @@ async def send_wake_word_greeting(client: ConnectedClient):
     
     # Get a random greeting from a selection
     greetings = [
-        "Yes?",
-        "How can I help?",
-        "I'm listening.",
-        "What can I do for you?",
-        "How may I assist you?"
+        "在呢？",
+        "需要帮忙吗？",
+        "我在听。",
+        "有什么需要我帮你的吗？", 
+        "我能为您做些什么？"
     ]
     greeting = random.choice(greetings)
     

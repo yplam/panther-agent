@@ -48,6 +48,8 @@ class AgentState(TypedDict):
     error_message: Optional[str]          # Error details
     # Add conversation history management if needed
     conversation_history: List[Dict[str, str]]
+    listening_mode: str                   # "manual", "auto", or "continuous"
+    is_streaming_asr: bool                # Whether we're currently doing streaming ASR
 
 
 # --- Graph Nodes ---
@@ -56,12 +58,20 @@ async def run_asr(state: AgentState) -> AgentState:
     """Runs the ASR service on buffered input audio packets."""
     client = state["client"]
     logger.info(f"{client.client_id}: Running ASR for session {client.session_id}")
+    
+    # Check if we already have ASR text from streaming (is_streaming_asr=True)
+    if state.get("is_streaming_asr") and state.get("asr_text"):
+        logger.info(f"{client.client_id}: Using ASR text from streaming: {state['asr_text']}")
+        # ASR text is already in state, no need to transcribe again
+        return state
+        
     try:
         audio_data = state["input_audio"]
-        if not audio_data or len(audio_data) < 10:  # Ensure we have enough audio data
-            raise ValueError("Insufficient audio data for ASR.")
+        if not audio_data:  # Ensure we have some audio data
+            raise ValueError("No audio data for ASR.")
             
-        # Pass the list of opus packets directly to the updated ASR service
+        # Process the audio stream - for streaming, we'd process in smaller chunks
+        # rather than waiting for all audio to be collected
         transcription = await asr_service.transcribe(audio_data)
         state["asr_text"] = transcription
         state["error_message"] = None
@@ -402,3 +412,38 @@ workflow.add_edge("run_tts", END) # End after TTS streaming finishes or fails
 
 # Compile the graph
 app = workflow.compile() # checkpointer=memory
+
+# New method to handle streaming audio processing
+async def process_incoming_audio(client: ConnectedClient, opus_packet: bytes) -> Optional[str]:
+    """
+    Processes incoming audio packets for streaming ASR.
+    Returns transcription if speech is detected, None otherwise.
+    
+    Args:
+        client: Client connection
+        opus_packet: Audio data packet (Opus encoded)
+        
+    Returns:
+        Transcription text if detected, None otherwise
+    """
+    if client.state == ClientState.LISTENING:
+        # Process audio packet in streaming mode
+        transcription = await asr_service.process_audio_stream(
+            client_id=client.client_id,
+            session_id=client.session_id,
+            opus_packet=opus_packet
+        )
+        
+        # If we got a transcription, send it to the client
+        if transcription:
+            # Send STT result
+            stt_msg = protocol.create_stt_message(
+                transcription,
+                client.session_id
+            )
+            await client.websocket.send(stt_msg)
+            
+            # Return the transcription to trigger further processing
+            return transcription
+    
+    return None

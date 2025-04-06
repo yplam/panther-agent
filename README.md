@@ -63,13 +63,18 @@ This server implements the backend for an ESP32-based AI voice assistant, handli
     # TTS_SERVICE=azure
     # LLM_SERVICE=azure
 
+    # --- Language Settings ---
+    DEFAULT_LANGUAGE=zh-CN
+    TTS_LANGUAGE=zh-CN
+    ASR_LANGUAGE=zh-CN
+
     # --- OpenAI Services ---
     OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     # OPENAI_BASE_URL= # Optional: For local models or proxies
     ASR_MODEL=whisper-1
     LLM_MODEL=gpt-4o # Or gpt-3.5-turbo, etc.
     TTS_MODEL=tts-1
-    TTS_VOICE=alloy # Other options: echo, fable, onyx, nova, shimmer
+    TTS_VOICE=nova # Good for Chinese, other options: echo, fable, onyx, alloy, shimmer
 
     # --- Azure Services ---
     # Azure OpenAI Service (LLM)
@@ -81,9 +86,9 @@ This server implements the backend for an ESP32-based AI voice assistant, handli
     # Azure Speech Service (ASR and TTS)
     # AZURE_SPEECH_KEY=your_azure_speech_key
     # AZURE_SPEECH_REGION=eastus
-    # AZURE_SPEECH_RECOGNITION_LANGUAGE=en-US
-    # AZURE_SPEECH_SYNTHESIS_LANGUAGE=en-US
-    # AZURE_TTS_VOICE=en-US-JennyNeural
+    # AZURE_SPEECH_RECOGNITION_LANGUAGE=zh-CN
+    # AZURE_SPEECH_SYNTHESIS_LANGUAGE=zh-CN
+    # AZURE_TTS_VOICE=zh-CN-XiaoxiaoNeural
 
     # Azure Text Analytics (for emotion detection with Azure LLM)
     # AZURE_TEXT_ANALYTICS_KEY=your_azure_text_analytics_key
